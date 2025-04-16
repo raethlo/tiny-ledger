@@ -1,0 +1,8 @@
+{
+  "packages": ["go", "air", "gopls", "golangci-lint"],
+  "shell": {
+    "init_hook": [
+      "export GO111MODULE=on"
+    ]
+  }
+}
