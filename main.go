@@ -1,10 +1,12 @@
 package main
 
 import (
-	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 type Entry struct {
@@ -28,7 +30,7 @@ type Transfer struct {
 }
 
 type WithdrawRequest struct {
-	ID        string    `json:"id"` // unique txn ID
+	ID        string    `json:"id"`
 	AccountID string    `json:"account_id"`
 	Amount    float64   `json:"amount"`
 	Timestamp time.Time `json:"timestamp"`
@@ -37,35 +39,30 @@ type WithdrawRequest struct {
 var (
 	mu           sync.RWMutex
 	transactions []Transaction
-	// processed    = make(map[string]bool) // we should track idempotent ids and respond Found for processed tx
-	balances = make(map[string]float64)
+	balances     = make(map[string]float64)
 )
 
-func getTransactions(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	json.NewEncoder(w).Encode(transactions)
+func getTransactions(c *gin.Context) {
+	log.Println("GET /transactions")
+	mu.RLock()
+	defer mu.RUnlock()
+	c.JSON(http.StatusOK, transactions)
 }
 
-func processTransfer(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func processTransfer(c *gin.Context) {
+	var t Transfer
+	if err := c.ShouldBindJSON(&t); err != nil {
+		log.Println("POST /transfer - invalid json")
+		log.Println(err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
 
-	var t Transfer
-	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
+	log.Printf("POST /transfer - ID=%s Debit=%s Credit=%s Amount=%.2f\n",
+		t.ID, t.DebitAccountID, t.CreditAccountID, t.Amount)
 
 	if t.Amount <= 0 || t.DebitAccountID == t.CreditAccountID {
-		http.Error(w, "invalid transfer", http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transfer"})
 		return
 	}
 
@@ -73,7 +70,7 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	if balances[t.DebitAccountID] < t.Amount {
-		http.Error(w, "insufficient funds", http.StatusConflict)
+		c.JSON(http.StatusConflict, gin.H{"error": "insufficient funds"})
 		return
 	}
 
@@ -89,32 +86,54 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(t)
+	c.JSON(http.StatusCreated, t)
 }
 
-func withdraw(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func withdraw(c *gin.Context) {
+	var wr WithdrawRequest
+	if err := c.ShouldBindJSON(&wr); err != nil {
+		log.Println("POST /withdraw - invalid json")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
 
-	var wr WithdrawRequest
-	if err := json.NewDecoder(r.Body).Decode(&wr); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
+	log.Printf("POST /withdraw - ID=%s AccountID=%s Amount=%.2f\n",
+		wr.ID, wr.AccountID, wr.Amount)
 
 	if wr.Amount <= 0 {
-		http.Error(w, "amount must be greater than zero", http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than zero"})
 		return
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
+
+	if balances[wr.AccountID] < wr.Amount {
+		c.JSON(http.StatusConflict, gin.H{"error": "insufficient funds"})
+		return
+	}
+
+	balances[wr.AccountID] -= wr.Amount
+
+	transactions = append(transactions, Transaction{
+		ID:        wr.ID,
+		Timestamp: time.Now(),
+		Entries: []Entry{
+			{AccountID: wr.AccountID, Debit: wr.Amount},
+		},
+	})
+
+	c.Status(http.StatusCreated)
 }
 
 func main() {
-	http.HandleFunc("/transfer", processTransfer)
-	http.HandleFunc("/transactions", getTransactions)
-	http.HandleFunc("/withdraw", withdraw)
-	http.ListenAndServe(":8080", nil)
+	r := gin.Default()
+	balances["A"] = 100
+	balances["B"] = 100
+
+	r.POST("/transfer", processTransfer)
+	r.GET("/transactions", getTransactions)
+	r.POST("/withdraw", withdraw)
+
+	r.Run(":8080")
 }
