@@ -9,6 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const SYSTEM_ACCOUNT_ID = "system"
+
 type Entry struct {
 	AccountID string  `json:"account_id"`
 	Debit     float64 `json:"debit,omitempty"`
@@ -36,6 +38,13 @@ type WithdrawRequest struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+type DepositRequest struct {
+	ID        string    `json:"id"`
+	AccountID string    `json:"account_id"`
+	Amount    float64   `json:"amount"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 var (
 	mu           sync.RWMutex
 	transactions []Transaction
@@ -47,6 +56,13 @@ func getTransactions(c *gin.Context) {
 	mu.RLock()
 	defer mu.RUnlock()
 	c.JSON(http.StatusOK, transactions)
+}
+
+func getBalances(c *gin.Context) {
+	log.Println("GET /balances")
+	mu.RLock()
+	defer mu.RUnlock()
+	c.JSON(http.StatusOK, balances)
 }
 
 func processTransfer(c *gin.Context) {
@@ -61,7 +77,7 @@ func processTransfer(c *gin.Context) {
 	log.Printf("POST /transfer - ID=%s Debit=%s Credit=%s Amount=%.2f\n",
 		t.ID, t.DebitAccountID, t.CreditAccountID, t.Amount)
 
-	if t.Amount <= 0 || t.DebitAccountID == t.CreditAccountID {
+	if t.Amount <= 0 || t.DebitAccountID == t.CreditAccountID || t.CreditAccountID == SYSTEM_ACCOUNT_ID || t.DebitAccountID == SYSTEM_ACCOUNT_ID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transfer"})
 		return
 	}
@@ -120,6 +136,41 @@ func withdraw(c *gin.Context) {
 		Timestamp: time.Now(),
 		Entries: []Entry{
 			{AccountID: wr.AccountID, Debit: wr.Amount},
+			{AccountID: SYSTEM_ACCOUNT_ID, Credit: wr.Amount},
+		},
+	})
+
+	c.Status(http.StatusCreated)
+}
+
+func deposit(c *gin.Context) {
+	var dr DepositRequest
+
+	if err := c.ShouldBindJSON(&dr); err != nil {
+		log.Println("POST /withdraw - invalid json")
+		log.Println(err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+
+	log.Printf("POST /deposit - ID=%s AccountID=%s Amount=%.2f\n", dr.ID, dr.AccountID, dr.Amount)
+
+	if dr.Amount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than zero"})
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	balances[dr.AccountID] += dr.Amount
+
+	transactions = append(transactions, Transaction{
+		ID:        dr.ID,
+		Timestamp: time.Now(),
+		Entries: []Entry{
+			{AccountID: dr.AccountID, Credit: dr.Amount},
+			{AccountID: SYSTEM_ACCOUNT_ID, Debit: dr.Amount},
 		},
 	})
 
@@ -130,10 +181,14 @@ func main() {
 	r := gin.Default()
 	balances["A"] = 100
 	balances["B"] = 100
+	balances[SYSTEM_ACCOUNT_ID] = 100_000
+
+	r.GET("/transactions", getTransactions)
+	r.GET("/balances", getBalances)
 
 	r.POST("/transfer", processTransfer)
-	r.GET("/transactions", getTransactions)
 	r.POST("/withdraw", withdraw)
+	r.POST("/deposit", deposit)
 
 	r.Run(":8080")
 }
