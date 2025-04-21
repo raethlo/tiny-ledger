@@ -1,262 +1,175 @@
 package main
 
 import (
-	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-const SYSTEM_ACCOUNT_ID = "system"
+var ledger *Ledger
 
-type Entry struct {
-	AccountID string  `json:"account_id"`
-	Debit     float64 `json:"debit,omitempty"`
-	Credit    float64 `json:"credit,omitempty"`
+func main() {
+	r := gin.Default()
+	ledger = NewLedger()
+
+	// Init state
+	ledger.Deposit(DepositRequest{
+		ID:        "init-deposit-a",
+		AccountID: "A",
+		Amount:    100,
+		Timestamp: time.Now(),
+	})
+	ledger.Deposit(DepositRequest{
+		ID:        "init-deposit-b",
+		AccountID: "B",
+		Amount:    100,
+		Timestamp: time.Now(),
+	})
+
+	// V1: direct ledger access with locking
+	r.POST("/deposit", depositV1)
+	r.POST("/withdraw", withdrawV1)
+	r.POST("/transfer", transferV1)
+
+	r.GET("/balances", getBalances)
+	r.GET("/transactions", getTransactions)
+	r.GET("/accounts/:id/journal", getJournal)
+
+	// V2: queued processing
+	r.POST("/v2/deposit", depositV2)
+	r.POST("/v2/withdraw", withdrawV2)
+	r.POST("/v2/transfer", transferV2)
+
+	startLedgerWorker(ledger)
+
+	r.Run(":8080")
 }
 
-type Transaction struct {
-	ID        string    `json:"id"`
-	Timestamp time.Time `json:"timestamp"`
-	Entries   []Entry   `json:"entries"`
-}
+// V1 handlers
 
-type Transfer struct {
-	ID              string    `json:"id"`
-	DebitAccountID  string    `json:"debit_account_id"`
-	CreditAccountID string    `json:"credit_account_id"`
-	Amount          float64   `json:"amount"`
-	Timestamp       time.Time `json:"timestamp"`
-}
-
-type JournalEntry struct {
-	TxID           string    `json:"tx_id"`
-	AccountID      string    `json:"account_id"`
-	CounterpartyID string    `json:"counterparty_id"`
-	Timestamp      time.Time `json:"timestamp"`
-	Debit          float64   `json:"debit,omitempty"`
-	Credit         float64   `json:"credit,omitempty"`
-}
-
-type WithdrawRequest struct {
-	ID        string    `json:"id"`
-	AccountID string    `json:"account_id"`
-	Amount    float64   `json:"amount"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-type DepositRequest struct {
-	ID        string    `json:"id"`
-	AccountID string    `json:"account_id"`
-	Amount    float64   `json:"amount"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-var (
-	mu           sync.RWMutex
-	transactions []Transaction
-	balances     = make(map[string]float64)
-	seenTx       = make(map[string]bool)
-)
-
-func getTransactions(c *gin.Context) {
-	log.Println("GET /transactions")
-	mu.RLock()
-	defer mu.RUnlock()
-	c.JSON(http.StatusOK, transactions)
-}
-
-func getBalances(c *gin.Context) {
-	log.Println("GET /balances")
-	mu.RLock()
-	defer mu.RUnlock()
-	c.JSON(http.StatusOK, balances)
-}
-
-func processTransaction(id string, transactions []Transaction, entries []Entry) []Transaction {
-	now := time.Now() // in reality we would compare client clock and server clock to detect drift?
-	tx := Transaction{
-		ID:        id,
-		Timestamp: now,
-		Entries:   entries,
-	}
-	var updated = append(transactions, tx)
-	seenTx[id] = true
-	return updated
-}
-
-func processTransfer(c *gin.Context) {
-	var t Transfer
-	if err := c.ShouldBindJSON(&t); err != nil {
-		log.Println("POST /transfer - invalid json")
-		log.Println(err)
+func depositV1(c *gin.Context) {
+	var dr DepositRequest
+	if err := c.ShouldBindJSON(&dr); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
+	created, err := ledger.Deposit(dr)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 
-	log.Printf("POST /transfer - ID=%s Debit=%s Credit=%s Amount=%.2f\n",
-		t.ID, t.DebitAccountID, t.CreditAccountID, t.Amount)
-
-	if seenTx[t.ID] {
+	if !created {
 		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
 		return
 	}
 
-	if t.Amount <= 0 || t.DebitAccountID == t.CreditAccountID || t.CreditAccountID == SYSTEM_ACCOUNT_ID || t.DebitAccountID == SYSTEM_ACCOUNT_ID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transfer"})
+	c.JSON(http.StatusCreated, dr)
+}
+
+func withdrawV1(c *gin.Context) {
+	var wr WithdrawRequest
+	if err := c.ShouldBindJSON(&wr); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	created, err := ledger.Withdraw(wr)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if balances[t.DebitAccountID] < t.Amount {
-		c.JSON(http.StatusConflict, gin.H{"error": "insufficient funds"})
+	if !created {
+		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
 		return
 	}
 
-	balances[t.DebitAccountID] -= t.Amount
-	balances[t.CreditAccountID] += t.Amount
+	c.JSON(http.StatusCreated, wr)
+}
 
-	transactions = processTransaction(t.ID, transactions, []Entry{
-		{AccountID: t.DebitAccountID, Debit: t.Amount},
-		{AccountID: t.CreditAccountID, Credit: t.Amount},
-	})
+func transferV1(c *gin.Context) {
+	var t Transfer
+	if err := c.ShouldBindJSON(&t); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+
+	created, err := ledger.Transfer(t)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !created {
+		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
+		return
+	}
 
 	c.JSON(http.StatusCreated, t)
 }
 
-func withdraw(c *gin.Context) {
+// Read endpoints (strong read enabled)
+
+func getBalances(c *gin.Context) {
+	c.JSON(http.StatusOK, ledger.Balances(true))
+}
+
+func getTransactions(c *gin.Context) {
+	c.JSON(http.StatusOK, ledger.Transactions(true))
+}
+
+func getJournal(c *gin.Context) {
+	accountID := c.Param("id")
+	entries := ledger.Journal(accountID, true)
+	if len(entries) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no entries"})
+		return
+	}
+	c.JSON(http.StatusOK, entries)
+}
+
+func depositV2(c *gin.Context) {
+	var dr DepositRequest
+	if err := c.ShouldBindJSON(&dr); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	resp := make(chan error)
+	cmdQueue <- Command{Type: CmdDeposit, Payload: dr, Resp: resp}
+	if err := <-resp; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusCreated)
+}
+
+func withdrawV2(c *gin.Context) {
 	var wr WithdrawRequest
 	if err := c.ShouldBindJSON(&wr); err != nil {
-		log.Println("POST /withdraw - invalid json")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
-
-	log.Printf("POST /withdraw - ID=%s AccountID=%s Amount=%.2f\n",
-		wr.ID, wr.AccountID, wr.Amount)
-
-	if seenTx[wr.ID] {
-		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
+	resp := make(chan error)
+	cmdQueue <- Command{Type: CmdWithdraw, Payload: wr, Resp: resp}
+	if err := <-resp; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-
-	if wr.Amount <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than zero"})
-		return
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	if balances[wr.AccountID] < wr.Amount {
-		c.JSON(http.StatusConflict, gin.H{"error": "insufficient funds"})
-		return
-	}
-
-	balances[wr.AccountID] -= wr.Amount
-
-	transactions = processTransaction(wr.ID, transactions, []Entry{
-		{AccountID: wr.AccountID, Debit: wr.Amount},
-		{AccountID: SYSTEM_ACCOUNT_ID, Credit: wr.Amount},
-	})
-
 	c.Status(http.StatusCreated)
 }
 
-func deposit(c *gin.Context) {
-	var dr DepositRequest
-
-	if err := c.ShouldBindJSON(&dr); err != nil {
-		log.Println("POST /withdraw - invalid json")
-		log.Println(err)
+func transferV2(c *gin.Context) {
+	var t Transfer
+	if err := c.ShouldBindJSON(&t); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
-
-	log.Printf("POST /deposit - ID=%s AccountID=%s Amount=%.2f\n", dr.ID, dr.AccountID, dr.Amount)
-
-	if seenTx[dr.ID] {
-		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
+	resp := make(chan error)
+	cmdQueue <- Command{Type: CmdTransfer, Payload: t, Resp: resp}
+	if err := <-resp; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-
-	if dr.Amount <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than zero"})
-		return
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	balances[dr.AccountID] += dr.Amount
-
-	transactions = processTransaction(dr.ID, transactions, []Entry{
-		{AccountID: dr.AccountID, Credit: dr.Amount},
-		{AccountID: SYSTEM_ACCOUNT_ID, Debit: dr.Amount},
-	})
-
-	c.Status(http.StatusCreated)
-}
-
-func getAccountJournal(c *gin.Context) {
-	accountID := c.Param("id")
-
-	mu.RLock()
-	defer mu.RUnlock()
-
-	var rows []JournalEntry
-	for _, tx := range transactions {
-		if len(tx.Entries) != 2 {
-			panic("multi acc tx not supported yet")
-		}
-
-		var entry, counter Entry
-		if tx.Entries[0].AccountID == accountID {
-			entry = tx.Entries[0]
-			counter = tx.Entries[1]
-		} else if tx.Entries[1].AccountID == accountID {
-			entry = tx.Entries[1]
-			counter = tx.Entries[0]
-		} else {
-			continue
-		}
-
-		rows = append(rows, JournalEntry{
-			TxID:           tx.ID,
-			AccountID:      entry.AccountID,
-			CounterpartyID: counter.AccountID,
-			Timestamp:      tx.Timestamp,
-			Debit:          entry.Debit,
-			Credit:         entry.Credit,
-		})
-	}
-
-	if len(rows) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no entries for account"})
-		return
-	}
-
-	c.JSON(http.StatusOK, rows)
-}
-
-func main() {
-	r := gin.Default()
-	balances["A"] = 100
-	balances["B"] = 100
-	balances[SYSTEM_ACCOUNT_ID] = -200
-
-	r.GET("/transactions", getTransactions)
-	r.GET("/balances", getBalances)
-
-	r.GET("/accounts/:id/journal", getAccountJournal)
-
-	r.POST("/transfer", processTransfer)
-	r.POST("/withdraw", withdraw)
-	r.POST("/deposit", deposit)
-
-	r.Run(":8080")
+	c.JSON(http.StatusCreated, t)
 }
