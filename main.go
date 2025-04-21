@@ -34,7 +34,7 @@ type Transfer struct {
 type JournalEntry struct {
 	TxID           string    `json:"tx_id"`
 	AccountID      string    `json:"account_id"`
-	CounterpartyID string    `json:counterparty_id`
+	CounterpartyID string    `json:"counterparty_id"`
 	Timestamp      time.Time `json:"timestamp"`
 	Debit          float64   `json:"debit,omitempty"`
 	Credit         float64   `json:"credit,omitempty"`
@@ -194,17 +194,29 @@ func getAccountJournal(c *gin.Context) {
 
 	var rows []JournalEntry
 	for _, tx := range transactions {
-		for _, e := range tx.Entries {
-			if e.AccountID == accountID {
-				rows = append(rows, JournalEntry{
-					TxID:      tx.ID,
-					AccountID: e.AccountID,
-					Timestamp: tx.Timestamp,
-					Debit:     e.Debit,
-					Credit:    e.Credit,
-				})
-			}
+		if len(tx.Entries) != 2 {
+			panic("multi acc tx not supported yet")
 		}
+
+		var entry, counter Entry
+		if tx.Entries[0].AccountID == accountID {
+			entry = tx.Entries[0]
+			counter = tx.Entries[1]
+		} else if tx.Entries[1].AccountID == accountID {
+			entry = tx.Entries[1]
+			counter = tx.Entries[0]
+		} else {
+			continue
+		}
+
+		rows = append(rows, JournalEntry{
+			TxID:           tx.ID,
+			AccountID:      entry.AccountID,
+			CounterpartyID: counter.AccountID,
+			Timestamp:      tx.Timestamp,
+			Debit:          entry.Debit,
+			Credit:         entry.Credit,
+		})
 	}
 
 	if len(rows) == 0 {
@@ -219,7 +231,7 @@ func main() {
 	r := gin.Default()
 	balances["A"] = 100
 	balances["B"] = 100
-	balances[SYSTEM_ACCOUNT_ID] = 100_000
+	balances[SYSTEM_ACCOUNT_ID] = -200
 
 	r.GET("/transactions", getTransactions)
 	r.GET("/balances", getBalances)
