@@ -58,6 +58,7 @@ var (
 	mu           sync.RWMutex
 	transactions []Transaction
 	balances     = make(map[string]float64)
+	seenTx       = make(map[string]bool)
 )
 
 func getTransactions(c *gin.Context) {
@@ -74,6 +75,18 @@ func getBalances(c *gin.Context) {
 	c.JSON(http.StatusOK, balances)
 }
 
+func processTransaction(id string, transactions []Transaction, entries []Entry) []Transaction {
+	now := time.Now() // in reality we would compare client clock and server clock to detect drift?
+	tx := Transaction{
+		ID:        id,
+		Timestamp: now,
+		Entries:   entries,
+	}
+	var updated = append(transactions, tx)
+	seenTx[id] = true
+	return updated
+}
+
 func processTransfer(c *gin.Context) {
 	var t Transfer
 	if err := c.ShouldBindJSON(&t); err != nil {
@@ -85,6 +98,11 @@ func processTransfer(c *gin.Context) {
 
 	log.Printf("POST /transfer - ID=%s Debit=%s Credit=%s Amount=%.2f\n",
 		t.ID, t.DebitAccountID, t.CreditAccountID, t.Amount)
+
+	if seenTx[t.ID] {
+		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
+		return
+	}
 
 	if t.Amount <= 0 || t.DebitAccountID == t.CreditAccountID || t.CreditAccountID == SYSTEM_ACCOUNT_ID || t.DebitAccountID == SYSTEM_ACCOUNT_ID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transfer"})
@@ -102,13 +120,9 @@ func processTransfer(c *gin.Context) {
 	balances[t.DebitAccountID] -= t.Amount
 	balances[t.CreditAccountID] += t.Amount
 
-	transactions = append(transactions, Transaction{
-		ID:        t.ID,
-		Timestamp: time.Now(),
-		Entries: []Entry{
-			{AccountID: t.DebitAccountID, Debit: t.Amount},
-			{AccountID: t.CreditAccountID, Credit: t.Amount},
-		},
+	transactions = processTransaction(t.ID, transactions, []Entry{
+		{AccountID: t.DebitAccountID, Debit: t.Amount},
+		{AccountID: t.CreditAccountID, Credit: t.Amount},
 	})
 
 	c.JSON(http.StatusCreated, t)
@@ -125,6 +139,11 @@ func withdraw(c *gin.Context) {
 	log.Printf("POST /withdraw - ID=%s AccountID=%s Amount=%.2f\n",
 		wr.ID, wr.AccountID, wr.Amount)
 
+	if seenTx[wr.ID] {
+		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
+		return
+	}
+
 	if wr.Amount <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than zero"})
 		return
@@ -140,13 +159,9 @@ func withdraw(c *gin.Context) {
 
 	balances[wr.AccountID] -= wr.Amount
 
-	transactions = append(transactions, Transaction{
-		ID:        wr.ID,
-		Timestamp: time.Now(),
-		Entries: []Entry{
-			{AccountID: wr.AccountID, Debit: wr.Amount},
-			{AccountID: SYSTEM_ACCOUNT_ID, Credit: wr.Amount},
-		},
+	transactions = processTransaction(wr.ID, transactions, []Entry{
+		{AccountID: wr.AccountID, Debit: wr.Amount},
+		{AccountID: SYSTEM_ACCOUNT_ID, Credit: wr.Amount},
 	})
 
 	c.Status(http.StatusCreated)
@@ -164,6 +179,11 @@ func deposit(c *gin.Context) {
 
 	log.Printf("POST /deposit - ID=%s AccountID=%s Amount=%.2f\n", dr.ID, dr.AccountID, dr.Amount)
 
+	if seenTx[dr.ID] {
+		c.JSON(http.StatusFound, gin.H{"message": "transaction already processed"})
+		return
+	}
+
 	if dr.Amount <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than zero"})
 		return
@@ -174,13 +194,9 @@ func deposit(c *gin.Context) {
 
 	balances[dr.AccountID] += dr.Amount
 
-	transactions = append(transactions, Transaction{
-		ID:        dr.ID,
-		Timestamp: time.Now(),
-		Entries: []Entry{
-			{AccountID: dr.AccountID, Credit: dr.Amount},
-			{AccountID: SYSTEM_ACCOUNT_ID, Debit: dr.Amount},
-		},
+	transactions = processTransaction(dr.ID, transactions, []Entry{
+		{AccountID: dr.AccountID, Credit: dr.Amount},
+		{AccountID: SYSTEM_ACCOUNT_ID, Debit: dr.Amount},
 	})
 
 	c.Status(http.StatusCreated)
