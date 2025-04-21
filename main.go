@@ -31,6 +31,15 @@ type Transfer struct {
 	Timestamp       time.Time `json:"timestamp"`
 }
 
+type JournalEntry struct {
+	TxID           string    `json:"tx_id"`
+	AccountID      string    `json:"account_id"`
+	CounterpartyID string    `json:counterparty_id`
+	Timestamp      time.Time `json:"timestamp"`
+	Debit          float64   `json:"debit,omitempty"`
+	Credit         float64   `json:"credit,omitempty"`
+}
+
 type WithdrawRequest struct {
 	ID        string    `json:"id"`
 	AccountID string    `json:"account_id"`
@@ -177,6 +186,35 @@ func deposit(c *gin.Context) {
 	c.Status(http.StatusCreated)
 }
 
+func getAccountJournal(c *gin.Context) {
+	accountID := c.Param("id")
+
+	mu.RLock()
+	defer mu.RUnlock()
+
+	var rows []JournalEntry
+	for _, tx := range transactions {
+		for _, e := range tx.Entries {
+			if e.AccountID == accountID {
+				rows = append(rows, JournalEntry{
+					TxID:      tx.ID,
+					AccountID: e.AccountID,
+					Timestamp: tx.Timestamp,
+					Debit:     e.Debit,
+					Credit:    e.Credit,
+				})
+			}
+		}
+	}
+
+	if len(rows) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no entries for account"})
+		return
+	}
+
+	c.JSON(http.StatusOK, rows)
+}
+
 func main() {
 	r := gin.Default()
 	balances["A"] = 100
@@ -185,6 +223,8 @@ func main() {
 
 	r.GET("/transactions", getTransactions)
 	r.GET("/balances", getBalances)
+
+	r.GET("/accounts/:id/journal", getAccountJournal)
 
 	r.POST("/transfer", processTransfer)
 	r.POST("/withdraw", withdraw)
