@@ -23,6 +23,14 @@ All data is stored in-memory. There's no persistence, and restarting the app res
 - the API expects tx ids to be passed in, in reality we would generate a time based unique idempotency id in this place
 - for simplicity the transactions get committed right away but in a real world scenario we'd use 2-phase commits 
 
+## To Run
+You can pull a new devbox env locally that should have all deps, alternatively install go 1.21 locally
+```shell
+devbox shell
+go get
+air # this should hot-reload main and run our api, you can also go run main.go
+```
+
 ## API
 
 ### POST `/withdraw`
