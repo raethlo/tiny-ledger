@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 )
 
 type CommandType int
@@ -46,7 +47,7 @@ func startLedgerWorker(ledger *Ledger) {
 			}
 		},
 		OnPanic: func(r any) {
-			// log / alert / retry
+			log.Printf("[ledger_worker] error: %v", r)
 		},
 	}
 	worker.Start()
